@@ -19,6 +19,7 @@
 package org.apache.hadoop.hive.ql.plan;
 
 import org.apache.hadoop.hive.common.StringInternUtils;
+import org.apache.hadoop.hive.ql.exec.TableScanOperator.ProbeDecodeContext;
 import org.apache.hadoop.hive.ql.exec.Utilities;
 
 import java.util.ArrayList;
@@ -174,6 +175,8 @@ public class MapWork extends BaseWork {
   private LlapIODescriptor llapIoDesc;
 
   private boolean isMergeFromResolver;
+
+  private ProbeDecodeContext probeDecodeContext = null;
 
   public MapWork() {}
 
@@ -399,7 +402,7 @@ public class MapWork extends BaseWork {
     return llapIoDesc.cached;
   }
 
- public void setNameToSplitSample(HashMap<String, SplitSample> nameToSplitSample) {
+ public void setNameToSplitSample(Map<String, SplitSample> nameToSplitSample) {
     this.nameToSplitSample = nameToSplitSample;
   }
 
@@ -654,13 +657,11 @@ public class MapWork extends BaseWork {
 
   @Override
   public void configureJobConf(JobConf job) {
+    super.configureJobConf(job);
     for (PartitionDesc partition : aliasToPartnInfo.values()) {
       PlanUtils.configureJobConf(partition.getTableDesc(), job);
     }
     Collection<Operator<?>> mappers = aliasToWork.values();
-    for (FileSinkOperator fs : OperatorUtils.findOperators(mappers, FileSinkOperator.class)) {
-      PlanUtils.configureJobConf(fs.getConf().getTableInfo(), job);
-    }
     for (IConfigureJobConf icjc : OperatorUtils.findOperators(mappers, IConfigureJobConf.class)) {
       icjc.configureJobConf(job);
     }
@@ -828,7 +829,7 @@ public class MapWork extends BaseWork {
     return vectorPartitionDescList;
   }
 
-  public void setVectorizationEnabledConditionsMet(ArrayList<String> vectorizationEnabledConditionsMet) {
+  public void setVectorizationEnabledConditionsMet(Collection<String> vectorizationEnabledConditionsMet) {
     this.vectorizationEnabledConditionsMet = vectorizationEnabledConditionsMet == null ? null : VectorizationCondition.addBooleans(
             vectorizationEnabledConditionsMet, true);
   }
@@ -837,13 +838,21 @@ public class MapWork extends BaseWork {
     return vectorizationEnabledConditionsMet;
   }
 
-  public void setVectorizationEnabledConditionsNotMet(List<String> vectorizationEnabledConditionsNotMet) {
+  public void setVectorizationEnabledConditionsNotMet(Collection<String> vectorizationEnabledConditionsNotMet) {
     this.vectorizationEnabledConditionsNotMet = vectorizationEnabledConditionsNotMet == null ? null : VectorizationCondition.addBooleans(
             vectorizationEnabledConditionsNotMet, false);
   }
 
   public List<String> getVectorizationEnabledConditionsNotMet() {
     return vectorizationEnabledConditionsNotMet;
+  }
+
+  public ProbeDecodeContext getProbeDecodeContext() {
+    return probeDecodeContext;
+  }
+
+  public void setProbeDecodeContext(ProbeDecodeContext probeDecodeContext) {
+    this.probeDecodeContext = probeDecodeContext;
   }
 
   public class MapExplainVectorization extends BaseExplainVectorization {

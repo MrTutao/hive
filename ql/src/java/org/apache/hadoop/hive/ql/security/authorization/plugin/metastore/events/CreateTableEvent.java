@@ -19,7 +19,7 @@
 
 package org.apache.hadoop.hive.ql.security.authorization.plugin.metastore.events;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.metastore.api.Table;
@@ -68,7 +68,9 @@ public class CreateTableEvent extends HiveMetaStoreAuthorizableEvent {
     Table                     table = event.getTable();
     String                    uri   = getSdLocation(table.getSd());
 
-    ret.add(new HivePrivilegeObject(HivePrivilegeObjectType.DATABASE, table.getDbName(), null));
+    ret.add(new HivePrivilegeObject(HivePrivilegeObjectType.DATABASE, table.getDbName(), null, null, null,
+        HivePrivilegeObject.HivePrivObjectActionType.OTHER, null, null,
+        table.getOwner(), table.getOwnerType()));
     ret.add(getHivePrivilegeObject(table));
 
     if (StringUtils.isNotEmpty(uri)) {

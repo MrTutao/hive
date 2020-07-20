@@ -46,13 +46,13 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
 
-import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.optimizer.calcite.CalciteSubqueryRuntimeException;
@@ -79,10 +79,10 @@ import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveProject;
  */
 public class HiveSubQueryRemoveRule extends RelOptRule {
 
-  private HiveConf conf;
+  private final HiveConf conf;
 
   public HiveSubQueryRemoveRule(HiveConf conf) {
-    super(operand(RelNode.class, null, HiveSubQueryFinder.RELNODE_PREDICATE, any()),
+    super(operandJ(RelNode.class, null, HiveSubQueryFinder.RELNODE_PREDICATE, any()),
         HiveRelFactories.HIVE_BUILDER, "SubQueryRemoveRule:Filter");
     this.conf = conf;
   }
@@ -199,7 +199,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
 
       // id is appended since there could be multiple scalar subqueries and FILTER
       // is created using field name
-      String indicator = "alwaysTrue" + e.rel.getId();
+      String indicator = "trueLiteral";
       parentQueryFields.add(builder.alias(builder.literal(true), indicator));
       builder.project(parentQueryFields);
       builder.join(JoinRelType.LEFT, builder.literal(true), variablesSet);
@@ -283,7 +283,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
       //   end as v
       // from emp as e
       // left outer join (
-      //   select max(deptno) as m, count(*) as c, count(deptno) as d, "alwaysTrue" as indicator
+      //   select max(deptno) as m, count(*) as c, count(deptno) as d, "trueLiteral" as indicator
       //   group by name from emp) as q on e.name = q.name
       subqueryRestriction(e.rel);
       builder.push(e.rel);
@@ -294,7 +294,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
 
       final List<RexNode> parentQueryFields = new ArrayList<>();
       parentQueryFields.addAll(builder.fields());
-      String indicator = "alwaysTrue" + e.rel.getId();
+      String indicator = "trueLiteral" ;
       parentQueryFields.add(builder.alias(builder.literal(true), indicator));
       builder.project(parentQueryFields).as("q");
       builder.join(JoinRelType.LEFT, builder.literal(true), variablesSet);
@@ -432,10 +432,11 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
     }
 
     // Now the left join
+    String trueLiteral = "literalTrue";
     switch (logic) {
     case TRUE:
       if (fields.isEmpty()) {
-        builder.project(builder.alias(builder.literal(true), "i" + e.rel.getId()));
+        builder.project(builder.alias(builder.literal(true), trueLiteral));
         if (!variablesSet.isEmpty() && (e.getKind() == SqlKind.EXISTS
             || e.getKind() == SqlKind.IN)) {
           // avoid adding group by for correlated IN/EXISTS queries
@@ -456,7 +457,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
       }
       break;
     default:
-      fields.add(builder.alias(builder.literal(true), "i" + e.rel.getId()));
+      fields.add(builder.alias(builder.literal(true), trueLiteral));
       builder.project(fields);
       builder.distinct();
     }
@@ -494,7 +495,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
       break;
     }
     operands
-        .add(builder.isNotNull(builder.field("dt", "i" + e.rel.getId())), builder.literal(true));
+        .add(builder.isNotNull(builder.field("dt",trueLiteral)), builder.literal(true));
     if (!keyIsNulls.isEmpty()) {
       //Calcite creates null literal with Null type here but
       // because HIVE doesn't support null type it is appropriately typed boolean
@@ -576,7 +577,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
     }
 
     @Override public RexNode visitSubQuery(RexSubQuery subQuery) {
-      return RexUtil.eq(subQuery, this.subQuery) ? replacement : subQuery;
+      return subQuery.equals(this.subQuery) ? replacement : subQuery;
     }
   }
 
@@ -596,7 +597,7 @@ public class HiveSubQueryRemoveRule extends RelOptRule {
      * Returns whether a {@link Project} contains a sub-query.
      */
     public static final Predicate<RelNode> RELNODE_PREDICATE = new Predicate<RelNode>() {
-      @Override public boolean apply(RelNode relNode) {
+      @Override public boolean test(RelNode relNode) {
         if (relNode instanceof Project) {
           Project project = (Project) relNode;
           for (RexNode node : project.getProjects()) {

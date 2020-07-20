@@ -20,6 +20,7 @@ package org.apache.hadoop.hive.ql.optimizer.ppr;
 
 import java.util.AbstractSequentialList;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
@@ -27,7 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.hadoop.hive.common.ObjectPair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.StrictChecks;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
@@ -207,7 +208,7 @@ public class PartitionPruner extends Transform {
     if (compactExpr == null || isBooleanExpr(compactExpr)) {
       if (isFalseExpr(compactExpr)) {
         return new PrunedPartitionList(tab, key + compactExpr.getExprString(true),
-            new LinkedHashSet<Partition>(0), new ArrayList<String>(0), false);
+            Collections.emptySet(), Collections.emptyList(), false);
       }
       // For null and true values, return every partition
       return getAllPartsFromCacheOrServer(tab, key, true, prunedPartitionsMap);
@@ -242,7 +243,7 @@ public class PartitionPruner extends Transform {
     } catch (HiveException e) {
       throw new SemanticException(e);
     }
-    ppList = new PrunedPartitionList(tab, key, parts, null, unknownPartitions);
+    ppList = new PrunedPartitionList(tab, key, parts, Collections.emptyList(), unknownPartitions);
     if (partsCache != null) {
       partsCache.put(key, ppList);
     }
@@ -551,7 +552,7 @@ public class PartitionPruner extends Transform {
       List<PrimitiveTypeInfo> partColumnTypeInfos, ExprNodeGenericFuncDesc prunerExpr,
       String defaultPartitionName, List<String> partNames) throws HiveException, MetaException {
     // Prepare the expression to filter on the columns.
-    ObjectPair<PrimitiveObjectInspector, ExprNodeEvaluator> handle =
+    Pair<PrimitiveObjectInspector, ExprNodeEvaluator> handle =
         PartExprEvalUtils.prepareExpr(prunerExpr, partColumnNames, partColumnTypeInfos);
 
     // Filter the name list. Removing elements one by one can be slow on e.g. ArrayList,

@@ -18,6 +18,7 @@
 package org.apache.hadoop.hive.ql.parse;
 
 import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
@@ -30,12 +31,18 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 
 import static org.apache.hadoop.hive.ql.exec.repl.ReplExternalTables.FILE_NAME;
 import static org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils.INC_BOOTSTRAP_ROOT_DIR_NAME;
@@ -44,8 +51,6 @@ import static org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils.INC_BOOTSTRAP_R
  * Tests Table level replication scenarios.
  */
 public class TestTableLevelReplicationScenarios extends BaseReplicationScenariosAcidTables {
-
-  private static final String REPLICA_EXTERNAL_BASE = "/replica_external_base";
 
   @BeforeClass
   public static void classLevelSetup() throws Exception {
@@ -147,16 +152,21 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     if (lastReplId == null) {
       replica.run("drop database if exists " + replicatedDbName + " cascade");
     }
-    WarehouseInstance.Tuple tuple = primary.dump(replPolicy, oldReplPolicy, lastReplId, dumpWithClause);
+
+    WarehouseInstance.Tuple tuple = primary.dump(replPolicy, oldReplPolicy, dumpWithClause);
 
     if (bootstrappedTables != null) {
       verifyBootstrapDirInIncrementalDump(tuple.dumpLocation, bootstrappedTables);
     }
 
-    replica.load(replicatedDbName, tuple.dumpLocation, loadWithClause)
+    // If the policy contains '.'' means its table level replication.
+    verifyTableListForPolicy(tuple.dumpLocation, replPolicy.contains(".'") ? expectedTables : null);
+
+    replica.load(replicatedDbName, replPolicy, loadWithClause)
             .run("use " + replicatedDbName)
             .run("show tables")
-            .verifyResults(expectedTables);
+            .verifyResults(expectedTables)
+            .verifyReplTargetProperty(replicatedDbName);
 
     if (records == null) {
       records = new String[] {"1"};
@@ -169,10 +179,56 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     return tuple.lastReplicationId;
   }
 
+  private String replicateAndVerifyClearDump(String replPolicy, String oldReplPolicy, String lastReplId,
+                                    List<String> dumpWithClause,
+                                    List<String> loadWithClause,
+                                    String[] bootstrappedTables,
+                                    String[] expectedTables,
+                                    String[] records) throws Throwable {
+    if (dumpWithClause == null) {
+      dumpWithClause = new ArrayList<>();
+    }
+    if (loadWithClause == null) {
+      loadWithClause = new ArrayList<>();
+    }
+
+    // For bootstrap replication, drop the target database before triggering it.
+    if (lastReplId == null) {
+      replica.run("drop database if exists " + replicatedDbName + " cascade");
+    }
+
+    WarehouseInstance.Tuple tuple = primary.dump(replPolicy, oldReplPolicy, dumpWithClause);
+
+    if (bootstrappedTables != null) {
+      verifyBootstrapDirInIncrementalDump(tuple.dumpLocation, bootstrappedTables);
+    }
+
+    // If the policy contains '.'' means its table level replication.
+    verifyTableListForPolicy(tuple.dumpLocation, replPolicy.contains(".'") ? expectedTables : null);
+
+    replica.load(replicatedDbName, replPolicy, loadWithClause)
+            .run("use " + replicatedDbName)
+            .run("show tables")
+            .verifyResults(expectedTables)
+            .verifyReplTargetProperty(replicatedDbName);
+
+    if (records == null) {
+      records = new String[] {"1"};
+    }
+    for (String table : expectedTables) {
+      replica.run("use " + replicatedDbName)
+              .run("select a from " + table)
+              .verifyResults(records);
+    }
+    new Path(tuple.dumpLocation).getFileSystem(conf).delete(new Path(tuple.dumpLocation), true);
+    return tuple.lastReplicationId;
+  }
+
   private void verifyBootstrapDirInIncrementalDump(String dumpLocation, String[] bootstrappedTables)
           throws Throwable {
+    String hiveDumpDir = dumpLocation + File.separator + ReplUtils.REPL_HIVE_BASE_DIR;
     // _bootstrap directory should be created as bootstrap enabled on external tables.
-    Path dumpPath = new Path(dumpLocation, INC_BOOTSTRAP_ROOT_DIR_NAME);
+    Path dumpPath = new Path(hiveDumpDir, INC_BOOTSTRAP_ROOT_DIR_NAME);
 
     // If nothing to be bootstrapped.
     if (bootstrappedTables.length == 0) {
@@ -183,7 +239,7 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     Assert.assertTrue(primary.miniDFSCluster.getFileSystem().exists(dumpPath));
 
     // Check if the DB dump path have any tables other than the ones listed in bootstrappedTables.
-    Path dbPath = new Path(dumpPath, primaryDbName);
+    Path dbPath = new Path(dumpPath, EximUtil.METADATA_PATH_NAME + File.separator + primaryDbName);
     FileStatus[] fileStatuses = primary.miniDFSCluster.getFileSystem().listStatus(dbPath);
     Assert.assertEquals(fileStatuses.length, bootstrappedTables.length);
 
@@ -191,6 +247,37 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     for (String tableName : bootstrappedTables) {
       Path tblPath = new Path(dbPath, tableName);
       Assert.assertTrue(primary.miniDFSCluster.getFileSystem().exists(tblPath));
+    }
+  }
+
+  private void verifyTableListForPolicy(String dumpLocation, String[] tableList) throws Throwable {
+    FileSystem fileSystem = primary.miniDFSCluster.getFileSystem();
+    String hiveDumpLocation = dumpLocation + File.separator + ReplUtils.REPL_HIVE_BASE_DIR;
+    Path tableListFile = new Path(hiveDumpLocation, ReplUtils.REPL_TABLE_LIST_DIR_NAME);
+    tableListFile = new Path(tableListFile, primaryDbName.toLowerCase());
+
+    if (tableList == null) {
+      Assert.assertFalse(fileSystem.exists(tableListFile));
+      return;
+    } else {
+      Assert.assertTrue(fileSystem.exists(tableListFile));
+    }
+
+    BufferedReader reader = null;
+    try {
+      InputStream inputStream = fileSystem.open(tableListFile);
+      reader = new BufferedReader(new InputStreamReader(inputStream));
+      Set tableNames = new HashSet<>(Arrays.asList(tableList));
+      int numTable = 0;
+      for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+        numTable++;
+        Assert.assertTrue(tableNames.contains(line));
+      }
+      Assert.assertEquals(numTable, tableList.length);
+    } finally {
+      if (reader != null) {
+        reader.close();
+      }
     }
   }
 
@@ -223,8 +310,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
   @Test
   public void testBasicIncrementalWithIncludeList() throws Throwable {
     WarehouseInstance.Tuple tupleBootstrap = primary.run("use " + primaryDbName)
-            .dump(primaryDbName, null);
-    replica.load(replicatedDbName, tupleBootstrap.dumpLocation);
+            .dump(primaryDbName);
+    replica.load(replicatedDbName, primaryDbName);
 
     String[] originalNonAcidTables = new String[] {"t1", "t2"};
     String[] originalFullAcidTables = new String[] {"t3", "t4"};
@@ -242,8 +329,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
   @Test
   public void testBasicIncrementalWithIncludeAndExcludeList() throws Throwable {
     WarehouseInstance.Tuple tupleBootstrap = primary.run("use " + primaryDbName)
-            .dump(primaryDbName, null);
-    replica.load(replicatedDbName, tupleBootstrap.dumpLocation);
+            .dump(primaryDbName);
+    replica.load(replicatedDbName, primaryDbName);
 
     String[] originalTables = new String[] {"t1", "t11", "t2", "t3", "t111"};
     createTables(originalTables, CreateTableType.NON_ACID);
@@ -286,8 +373,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     // Test incremental replication with invalid replication policies in REPLACE clause.
     String replPolicy = primaryDbName;
     WarehouseInstance.Tuple tupleBootstrap = primary.run("use " + primaryDbName)
-            .dump(primaryDbName, null);
-    replica.load(replicatedDbName, tupleBootstrap.dumpLocation);
+            .dump(primaryDbName);
+    replica.load(replicatedDbName, primaryDbName);
     String lastReplId = tupleBootstrap.lastReplicationId;
     for (String oldReplPolicy : invalidReplPolicies) {
       failed = false;
@@ -346,7 +433,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
 
     // Replicate and verify if all 3 tables are replicated to target.
     for (String replPolicy : fullDbReplPolicies) {
-      replicateAndVerify(replPolicy, null, null, null, originalTables);
+      replicateAndVerifyClearDump(replPolicy, null, null, null,
+              null, null, originalTables, null);
     }
   }
 
@@ -400,27 +488,28 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     createTables(originalExternalTables, CreateTableType.EXTERNAL);
 
     // Replicate and verify if only 2 tables are replicated to target.
-    List<String> loadWithClause = ReplicationTestUtils.externalTableBasePathWithClause(REPLICA_EXTERNAL_BASE, replica);
-    List<String> dumpWithClause = Collections.singletonList(
-            "'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'"
-    );
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(true);
+    List<String> dumpWithClause = ReplicationTestUtils.includeExternalTableClause(true);
     String replPolicy = primaryDbName + ".'(a[0-9]+)|(b2)'.'a1'";
     String[] replicatedTables = new String[] {"a2", "b2"};
     WarehouseInstance.Tuple tuple = primary.run("use " + primaryDbName)
-            .dump(replPolicy, null, dumpWithClause);
+            .dump(replPolicy, dumpWithClause);
 
+    String hiveDumpDir = tuple.dumpLocation + File.separator + ReplUtils.REPL_HIVE_BASE_DIR;
+    Path metaDataPath = new Path(hiveDumpDir, EximUtil.METADATA_PATH_NAME);
     // the _external_tables_file info should be created as external tables are to be replicated.
     Assert.assertTrue(primary.miniDFSCluster.getFileSystem()
-            .exists(new Path(new Path(tuple.dumpLocation, primaryDbName.toLowerCase()), FILE_NAME)));
+            .exists(new Path(new Path(metaDataPath, primaryDbName.toLowerCase()), FILE_NAME)));
 
     // Verify that the external table info contains only table "a2".
     ReplicationTestUtils.assertExternalFileInfo(primary, Arrays.asList("a2"),
-            new Path(new Path(tuple.dumpLocation, primaryDbName.toLowerCase()), FILE_NAME));
+            new Path(new Path(metaDataPath, primaryDbName.toLowerCase()), FILE_NAME));
 
-    replica.load(replicatedDbName, tuple.dumpLocation, loadWithClause)
+    replica.load(replicatedDbName, replPolicy, loadWithClause)
             .run("use " + replicatedDbName)
             .run("show tables")
-            .verifyResults(replicatedTables);
+            .verifyResults(replicatedTables)
+            .verifyReplTargetProperty(replicatedDbName);
   }
 
   @Test
@@ -431,10 +520,9 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     createTables(originalExternalTables, CreateTableType.EXTERNAL);
 
     // Bootstrap should exclude external tables.
-    List<String> loadWithClause = ReplicationTestUtils.externalTableBasePathWithClause(REPLICA_EXTERNAL_BASE, replica);
-    List<String> dumpWithClause = Collections.singletonList(
-            "'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='false'"
-    );
+    List<String> dumpWithClause = ReplicationTestUtils.includeExternalTableClause(false);
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(false);
+
     String replPolicy = primaryDbName + ".'(a[0-9]+)|(b2)'.'a1'";
     String[] bootstrapReplicatedTables = new String[] {"b2"};
     String lastReplId = replicateAndVerify(replPolicy, null,
@@ -442,23 +530,26 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
 
     // Enable external tables replication and bootstrap in incremental phase.
     String[] incrementalReplicatedTables = new String[] {"a2", "b2"};
-    dumpWithClause = Arrays.asList("'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
-            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'");
+    dumpWithClause = ReplicationTestUtils.includeExternalTableClause(true);
+    dumpWithClause.add("'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'");
     WarehouseInstance.Tuple tuple = primary.run("use " + primaryDbName)
-            .dump(replPolicy, lastReplId, dumpWithClause);
+            .dump(replPolicy, dumpWithClause);
+    loadWithClause = ReplicationTestUtils.includeExternalTableClause(true);
 
+    String hiveDumpDir = tuple.dumpLocation + File.separator + ReplUtils.REPL_HIVE_BASE_DIR;
     // the _external_tables_file info should be created as external tables are to be replicated.
     Assert.assertTrue(primary.miniDFSCluster.getFileSystem()
-            .exists(new Path(tuple.dumpLocation, FILE_NAME)));
+            .exists(new Path(hiveDumpDir, FILE_NAME)));
 
     // Verify that the external table info contains only table "a2".
     ReplicationTestUtils.assertExternalFileInfo(primary, Arrays.asList("a2"),
-            new Path(tuple.dumpLocation, FILE_NAME));
+            new Path(hiveDumpDir, FILE_NAME));
 
-    replica.load(replicatedDbName, tuple.dumpLocation, loadWithClause)
+    replica.load(replicatedDbName, replPolicy, loadWithClause)
             .run("use " + replicatedDbName)
             .run("show tables")
-            .verifyResults(incrementalReplicatedTables);
+            .verifyResults(incrementalReplicatedTables)
+            .verifyReplTargetProperty(replicatedDbName);
   }
 
   @Test
@@ -566,10 +657,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     createTables(originalExternalTables, CreateTableType.EXTERNAL);
 
     // Bootstrap should exclude external tables.
-    List<String> loadWithClause = ReplicationTestUtils.externalTableBasePathWithClause(REPLICA_EXTERNAL_BASE, replica);
-    List<String> dumpWithClause = Collections.singletonList(
-            "'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='false'"
-    );
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(false);
+    List<String> dumpWithClause = ReplicationTestUtils.includeExternalTableClause(false);
     String replPolicy = primaryDbName + ".'(a[0-9]+)|(b1)'.'a1'";
     String[] bootstrapReplicatedTables = new String[] {"b1"};
     String lastReplId = replicateAndVerify(replPolicy, null,
@@ -593,23 +682,26 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     dumpWithClause = Arrays.asList("'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
             "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'");
     WarehouseInstance.Tuple tuple = primary.run("use " + primaryDbName)
-            .dump(replPolicy, oldReplPolicy, lastReplId, dumpWithClause);
+            .dump(replPolicy, oldReplPolicy, dumpWithClause);
+    loadWithClause = ReplicationTestUtils.includeExternalTableClause(true);
 
+    String hiveDumpDir = tuple.dumpLocation + File.separator + ReplUtils.REPL_HIVE_BASE_DIR;
     // the _external_tables_file info should be created as external tables are to be replicated.
     Assert.assertTrue(primary.miniDFSCluster.getFileSystem()
-            .exists(new Path(tuple.dumpLocation, FILE_NAME)));
+            .exists(new Path(hiveDumpDir, FILE_NAME)));
 
     // Verify that the external table info contains table "a2" and "c2".
     ReplicationTestUtils.assertExternalFileInfo(primary, Arrays.asList("a2", "c2"),
-            new Path(tuple.dumpLocation, FILE_NAME));
+            new Path(hiveDumpDir, FILE_NAME));
 
     // Verify if the expected tables are bootstrapped.
     verifyBootstrapDirInIncrementalDump(tuple.dumpLocation, bootstrappedTables);
 
-    replica.load(replicatedDbName, tuple.dumpLocation, loadWithClause)
+    replica.load(replicatedDbName, replPolicy, loadWithClause)
             .run("use " + replicatedDbName)
             .run("show tables")
-            .verifyResults(incrementalReplicatedTables);
+            .verifyResults(incrementalReplicatedTables)
+            .verifyReplTargetProperty(replicatedDbName);
   }
 
   @Test
@@ -660,7 +752,7 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
             .run("alter table out100 rename to in100") // this will add the bootstrap
             .run("drop table in100");  // table in100 is dropped, so no bootstrap should happen.
 
-    replicatedTables = new String[] {"in200", "in12", "in12", "in14"};
+    replicatedTables = new String[] {"in200", "in12", "in11", "in14"};
     bootstrapTables = new String[] {"in14", "in200"};
     replicateAndVerify(replPolicy, null, lastReplId, null,
             null, bootstrapTables, replicatedTables);
@@ -738,7 +830,7 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
   @Test
   public void testRenameTableScenariosExternalTable() throws Throwable {
     String replPolicy = primaryDbName + ".'in[0-9]+'.'out[0-9]+'";
-    List<String> loadWithClause = ReplicationTestUtils.externalTableBasePathWithClause(REPLICA_EXTERNAL_BASE, replica);
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(false);
     List<String> dumpWithClause = Arrays.asList(
             "'" +  HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='false'",
             "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='false'",
@@ -770,8 +862,10 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
             "'" +  HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
             "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'",
             "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_ACID_TABLES.varname + "'='true'",
-            "'" + ReplUtils.REPL_DUMP_INCLUDE_ACID_TABLES + "'='true'"
+            "'" + ReplUtils.REPL_DUMP_INCLUDE_ACID_TABLES + "'='true'",
+            "'distcp.options.pugpb'=''"
     );
+    loadWithClause = ReplicationTestUtils.includeExternalTableClause(true);
     replicatedTables = new String[] {"in1", "in2", "in3", "in4", "in5"};
     bootstrapTables = new String[] {"in2", "in3", "in4", "in5"};
     lastReplId = replicateAndVerify(replPolicy, null, lastReplId, dumpWithClause,
@@ -795,11 +889,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
 
   @Test
   public void testRenameTableScenariosWithReplaceExternalTable() throws Throwable {
-    List<String> loadWithClause = ReplicationTestUtils.externalTableBasePathWithClause(REPLICA_EXTERNAL_BASE, replica);
-    List<String> dumpWithClause = Arrays.asList(
-            "'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
-            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'"
-    );
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(true);
+    List<String> dumpWithClause = ReplicationTestUtils.externalTableWithClause(loadWithClause, true, true);
     String replPolicy = primaryDbName + ".'(in[0-9]+)|(out4)|(out5)|(out1500)'";
     String lastReplId = replicateAndVerify(replPolicy, null, null, dumpWithClause,
             loadWithClause, new String[] {}, new String[] {});
@@ -822,7 +913,8 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     String newPolicy = primaryDbName + ".'(in[0-9]+)|(out1500)|(in2)'";
     dumpWithClause = Arrays.asList(
             "'" + HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
-            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='false'"
+            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='false'",
+            "'distcp.options.pugpb'=''"
     );
 
     // in2 should be dropped.
@@ -906,5 +998,73 @@ public class TestTableLevelReplicationScenarios extends BaseReplicationScenarios
     bootstrapTables = new String[] {"out12", "in2", "in400", "in1", "in300", "in12", "out5002"};
     replicateAndVerify(newPolicy, replPolicy, lastReplId, null,
             null, bootstrapTables, replicatedTables, new String[] {"1", "2"});
+  }
+
+  @Test
+  public void testRenameTableScenariosUpgrade() throws Throwable {
+    // Policy with no table level filter, no ACID and external table.
+    String replPolicy = primaryDbName;
+    List<String> loadWithClause = ReplicationTestUtils.includeExternalTableClause(false);
+    List<String> dumpWithClause = Arrays.asList(
+            "'" +  HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='false'",
+            "'" + ReplUtils.REPL_DUMP_INCLUDE_ACID_TABLES + "'='false'"
+    );
+
+    String[] originalNonAcidTables = new String[] {"in1", "out4"};
+    String[] originalExternalTables = new String[] {"in2", "out5"};
+    String[] originalAcidTables = new String[] {"in3", "out6"};
+    createTables(originalNonAcidTables, CreateTableType.NON_ACID);
+    createTables(originalExternalTables, CreateTableType.EXTERNAL);
+    createTables(originalAcidTables, CreateTableType.FULL_ACID);
+
+    // Only NON_ACID table replication is done.
+    String[] replicatedTables = new String[] {"in1", "out4"};
+    String lastReplId = replicateAndVerify(replPolicy, null, null, dumpWithClause,
+            null, new String[] {}, replicatedTables);
+
+    originalNonAcidTables = new String[] {"in7", "out10"};
+    originalExternalTables = new String[] {"in8", "out11"};
+    originalAcidTables = new String[] {"in9", "out12"};
+    createTables(originalNonAcidTables, CreateTableType.NON_ACID);
+    createTables(originalExternalTables, CreateTableType.EXTERNAL);
+    createTables(originalAcidTables, CreateTableType.MM_ACID);
+
+    primary.run("use " + primaryDbName)
+            .run("alter table out4 rename to in4")
+            .run("alter table out5 rename to in5")
+            .run("alter table out6 rename to in6");
+
+    // Table level replication with ACID and EXTERNAL table.
+    String newReplPolicy = primaryDbName + ".'in[0-9]+'.'in8'";
+    dumpWithClause = Arrays.asList(
+            "'" +  HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
+            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_EXTERNAL_TABLES.varname + "'='true'",
+            "'" + HiveConf.ConfVars.REPL_BOOTSTRAP_ACID_TABLES.varname + "'='true'",
+            "'" + ReplUtils.REPL_DUMP_INCLUDE_ACID_TABLES + "'='true'",
+            "'distcp.options.pugpb'=''"
+    );
+
+    replicatedTables = new String[] {"in1", "in2", "in3", "in4", "in5", "in6", "in7", "in9"};
+    String[] bootstrapTables = new String[] {"in2", "in3", "in4", "in5", "in6", "in9"};
+    lastReplId = replicateAndVerify(newReplPolicy, replPolicy, lastReplId, dumpWithClause,
+            loadWithClause, bootstrapTables, replicatedTables);
+
+    primary.run("use " + primaryDbName)
+            .run("alter table in4 rename to out4")
+            .run("alter table in5 rename to out5")
+            .run("alter table in6 rename to out6");
+
+    dumpWithClause = Arrays.asList(
+            "'" +  HiveConf.ConfVars.REPL_INCLUDE_EXTERNAL_TABLES.varname + "'='true'",
+            "'" + ReplUtils.REPL_DUMP_INCLUDE_ACID_TABLES + "'='true'",
+            "'distcp.options.pugpb'=''"
+    );
+
+    // Database replication with ACID and EXTERNAL table.
+    replicatedTables = new String[] {"in1", "in2", "in3", "out4", "out5", "out6", "in7", "in8",
+            "in9", "out10", "out11", "out12"};
+    bootstrapTables = new String[] {"out4", "out5", "out6", "in8", "out10", "out11", "out12"};
+    replicateAndVerify(replPolicy, newReplPolicy, lastReplId, dumpWithClause,
+            loadWithClause, bootstrapTables, replicatedTables);
   }
 }

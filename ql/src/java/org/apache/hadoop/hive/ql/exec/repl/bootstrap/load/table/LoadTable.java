@@ -27,7 +27,7 @@ import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.DDLWork;
-import org.apache.hadoop.hive.ql.ddl.table.creation.DropTableDesc;
+import org.apache.hadoop.hive.ql.ddl.table.drop.DropTableDesc;
 import org.apache.hadoop.hive.ql.exec.ReplCopyTask;
 import org.apache.hadoop.hive.ql.exec.Task;
 import org.apache.hadoop.hive.ql.exec.TaskFactory;
@@ -42,11 +42,11 @@ import org.apache.hadoop.hive.ql.exec.repl.bootstrap.load.util.PathUtils;
 import org.apache.hadoop.hive.ql.io.AcidUtils;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.Table;
-import org.apache.hadoop.hive.ql.parse.EximUtil;
 import org.apache.hadoop.hive.ql.parse.ImportSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.parse.ReplicationSpec;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
 import org.apache.hadoop.hive.ql.parse.repl.ReplLogger;
+import org.apache.hadoop.hive.ql.parse.repl.metric.ReplicationMetricCollector;
 import org.apache.hadoop.hive.ql.plan.ImportTableDesc;
 import org.apache.hadoop.hive.ql.plan.LoadMultiFilesDesc;
 import org.apache.hadoop.hive.ql.plan.LoadTableDesc;
@@ -74,14 +74,16 @@ public class LoadTable {
   private final TableContext tableContext;
   private final TaskTracker tracker;
   private final TableEvent event;
+  private final ReplicationMetricCollector metricCollector;
 
   public LoadTable(TableEvent event, Context context, ReplLogger replLogger,
-      TableContext tableContext, TaskTracker limiter) {
+      TableContext tableContext, TaskTracker limiter, ReplicationMetricCollector metricCollector) {
     this.event = event;
     this.context = context;
     this.replLogger = replLogger;
     this.tableContext = tableContext;
     this.tracker = new TaskTracker(limiter);
+    this.metricCollector = metricCollector;
   }
 
   public TaskTracker tasks(boolean isBootstrapDuringInc) throws Exception {
@@ -151,8 +153,8 @@ public class LoadTable {
             context.hiveConf
     );
     if (!isPartitioned(tableDesc)) {
-      Task<? extends Serializable> replLogTask
-              = ReplUtils.getTableReplLogTask(tableDesc, replLogger, context.hiveConf);
+      Task<?> replLogTask
+              = ReplUtils.getTableReplLogTask(tableDesc, replLogger, context.hiveConf, metricCollector);
       ckptTask.addDependentTask(replLogTask);
     }
     tracker.addDependentTask(ckptTask);
@@ -223,7 +225,7 @@ public class LoadTable {
     if (shouldCreateLoadTableTask) {
       LOG.debug("adding dependent ReplTxnTask/CopyWork/MoveWork for table");
       Task<?> loadTableTask = loadTableTask(table, replicationSpec, new Path(tblDesc.getLocation()),
-              event.metadataPath());
+              event.dataPath());
       parentTask.addDependentTask(loadTableTask);
     }
     tracker.addTask(tblRootTask);
@@ -272,7 +274,7 @@ public class LoadTable {
 
   private Task<?> loadTableTask(Table table, ReplicationSpec replicationSpec, Path tgtPath,
       Path fromURI) {
-    Path dataPath = new Path(fromURI, EximUtil.DATA_PATH_NAME);
+    Path dataPath = fromURI;
     Path tmpPath = tgtPath;
 
     // if move optimization is enabled, copy the files directly to the target path. No need to create the staging dir.
@@ -296,7 +298,8 @@ public class LoadTable {
             + table.getCompleteName() + " with source location: "
             + dataPath.toString() + " and target location " + tgtPath.toString());
 
-    Task<?> copyTask = ReplCopyTask.getLoadCopyTask(replicationSpec, dataPath, tmpPath, context.hiveConf);
+    Task<?> copyTask = ReplCopyTask.getLoadCopyTask(replicationSpec, dataPath, tmpPath, context.hiveConf,
+            false, false);
 
     MoveWork moveWork = new MoveWork(new HashSet<>(), new HashSet<>(), null, null, false);
     if (AcidUtils.isTransactionalTable(table)) {
@@ -334,8 +337,7 @@ public class LoadTable {
 
   private Task<?> dropTableTask(Table table) {
     assert(table != null);
-    DropTableDesc dropTblDesc = new DropTableDesc(table.getFullyQualifiedName(), table.getTableType(),
-            true, false, event.replicationSpec());
+    DropTableDesc dropTblDesc = new DropTableDesc(table.getFullyQualifiedName(), true, false, event.replicationSpec());
     return TaskFactory.get(new DDLWork(new HashSet<>(), new HashSet<>(), dropTblDesc), context.hiveConf);
   }
 }

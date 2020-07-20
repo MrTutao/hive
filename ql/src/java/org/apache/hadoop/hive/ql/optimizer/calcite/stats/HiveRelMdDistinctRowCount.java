@@ -25,7 +25,6 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinRelType;
-import org.apache.calcite.rel.core.SemiJoin;
 import org.apache.calcite.rel.metadata.ChainedRelMetadataProvider;
 import org.apache.calcite.rel.metadata.ReflectiveRelMetadataProvider;
 import org.apache.calcite.rel.metadata.RelMdDistinctRowCount;
@@ -41,6 +40,7 @@ import org.apache.calcite.util.NumberUtil;
 import org.apache.hadoop.hive.ql.optimizer.calcite.HiveCalciteUtil;
 import org.apache.hadoop.hive.ql.optimizer.calcite.cost.HiveCost;
 import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveJoin;
+import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveSemiJoin;
 import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveTableScan;
 import org.apache.hadoop.hive.ql.plan.ColStatistics;
 
@@ -48,17 +48,9 @@ import com.google.common.collect.ImmutableList;
 
 public class HiveRelMdDistinctRowCount extends RelMdDistinctRowCount {
 
-  private static final HiveRelMdDistinctRowCount INSTANCE =
-      new HiveRelMdDistinctRowCount();
-
-  public static final RelMetadataProvider SOURCE = ChainedRelMetadataProvider
-      .of(ImmutableList.of(
-
+  public static final RelMetadataProvider SOURCE =
       ReflectiveRelMetadataProvider.reflectiveSource(
-          BuiltInMethod.DISTINCT_ROW_COUNT.method, INSTANCE),
-
-      ReflectiveRelMetadataProvider.reflectiveSource(
-          BuiltInMethod.CUMULATIVE_COST.method, INSTANCE)));
+          BuiltInMethod.DISTINCT_ROW_COUNT.method, new HiveRelMdDistinctRowCount());
 
   private HiveRelMdDistinctRowCount() {
   }
@@ -82,22 +74,15 @@ public class HiveRelMdDistinctRowCount extends RelMdDistinctRowCount {
         .getCluster().getRexBuilder().makeLiteral(true));
   }
 
-  @Override
-  public Double getDistinctRowCount(Join rel, RelMetadataQuery mq, ImmutableBitSet groupKey,
+  public Double getDistinctRowCount(HiveSemiJoin rel, RelMetadataQuery mq, ImmutableBitSet groupKey,
       RexNode predicate) {
-    if (rel instanceof HiveJoin) {
-      HiveJoin hjRel = (HiveJoin) rel;
-      //TODO: Improve this
-      if (rel instanceof SemiJoin) {
-        return mq.getDistinctRowCount(hjRel.getLeft(), groupKey,
-            rel.getCluster().getRexBuilder().makeLiteral(true));
-      } else {
-        return getJoinDistinctRowCount(mq, rel, rel.getJoinType(),
-            groupKey, predicate, true);
-      }
-    }
+    return super.getDistinctRowCount(rel, mq, groupKey, predicate);
+  }
 
-    return mq.getDistinctRowCount(rel, groupKey, predicate);
+  public Double getDistinctRowCount(HiveJoin rel, RelMetadataQuery mq, ImmutableBitSet groupKey,
+      RexNode predicate) {
+    return getJoinDistinctRowCount(mq, rel, rel.getJoinType(),
+           groupKey, predicate, true);
   }
 
   /**
@@ -116,7 +101,7 @@ public class HiveRelMdDistinctRowCount extends RelMdDistinctRowCount {
    *                  otherwise use <code>left NDV * right NDV</code>.
    * @return number of distinct rows
    */
-  public static Double getJoinDistinctRowCount(RelMetadataQuery mq,
+  private static Double getJoinDistinctRowCount(RelMetadataQuery mq,
       RelNode joinRel, JoinRelType joinType, ImmutableBitSet groupKey,
       RexNode predicate, boolean useMaxNdv) {
     Double distRowCount = null;
@@ -172,19 +157,4 @@ public class HiveRelMdDistinctRowCount extends RelMdDistinctRowCount {
     return RelMdUtil.numDistinctVals(distRowCount, mq.getRowCount(joinRel));
   }
 
-  /*
-   * Favor Broad Plans over Deep Plans.
-   */
-  public RelOptCost getCumulativeCost(HiveJoin rel, RelMetadataQuery mq) {
-    RelOptCost cost = mq.getNonCumulativeCost(rel);
-    List<RelNode> inputs = rel.getInputs();
-    RelOptCost maxICost = HiveCost.ZERO;
-    for (RelNode input : inputs) {
-      RelOptCost iCost = mq.getCumulativeCost(input);
-      if (maxICost.isLt(iCost)) {
-        maxICost = iCost;
-      }
-    }
-    return cost.plus(maxICost);
-  }
 }

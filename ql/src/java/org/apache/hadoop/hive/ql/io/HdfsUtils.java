@@ -26,8 +26,9 @@ import java.net.URI;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -101,10 +102,9 @@ public class HdfsUtils {
   //       as public utility method in HDFS to obtain the inode-based path.
   private static String HDFS_ID_PATH_PREFIX = "/.reserved/.inodes/";
 
-  public static Path getFileIdPath(
-      FileSystem fileSystem, Path path, long fileId) {
-    return ((fileSystem instanceof DistributedFileSystem))
-        ? new Path(HDFS_ID_PATH_PREFIX + fileId) : path;
+  public static Path getFileIdPath(Path path, long fileId) {
+    // BI/ETL split strategies set fileId correctly when HDFS is used.
+    return (fileId > 0) ? new Path(HDFS_ID_PATH_PREFIX + fileId) : path;
   }
 
   public static boolean isDefaultFs(DistributedFileSystem fs) {

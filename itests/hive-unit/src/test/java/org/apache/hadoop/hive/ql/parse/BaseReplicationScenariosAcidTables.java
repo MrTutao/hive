@@ -17,17 +17,19 @@
  */
 package org.apache.hadoop.hive.ql.parse;
 
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hive.cli.CliSessionState;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.api.AllocateTableWriteIdsRequest;
 import org.apache.hadoop.hive.metastore.api.OpenTxnRequest;
 import org.apache.hadoop.hive.metastore.api.OpenTxnsResponse;
+import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.metastore.txn.TxnDbUtil;
 import org.apache.hadoop.hive.metastore.txn.TxnStore;
 import org.apache.hadoop.hive.ql.DriverFactory;
 import org.apache.hadoop.hive.ql.IDriver;
-import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.hive.shims.Utils;
 
@@ -58,6 +60,8 @@ public class BaseReplicationScenariosAcidTables {
   public final TestName testName = new TestName();
 
   protected static final Logger LOG = LoggerFactory.getLogger(TestReplicationScenarios.class);
+  private static final Path REPLICA_EXTERNAL_BASE = new Path("/replica_external_base");
+  protected static String fullyQualifiedReplicaExternalBase;
   static WarehouseInstance primary;
   static WarehouseInstance replica, replicaNonAcid;
   static HiveConf conf;
@@ -78,17 +82,19 @@ public class BaseReplicationScenariosAcidTables {
       put("hive.txn.manager", "org.apache.hadoop.hive.ql.lockmgr.DbTxnManager");
       put("hive.metastore.client.capability.check", "false");
       put("hive.repl.bootstrap.dump.open.txn.timeout", "1s");
-      put("hive.exec.dynamic.partition.mode", "nonstrict");
       put("hive.strict.checks.bucketing", "false");
       put("hive.mapred.mode", "nonstrict");
       put("mapred.input.dir.recursive", "true");
       put("hive.metastore.disallow.incompatible.col.type.changes", "false");
       put("hive.in.repl.test", "true");
+      put("metastore.warehouse.tenant.colocation", "true");
     }};
 
     acidEnableConf.putAll(overrides);
 
+    setReplicaExternalBase(miniDFSCluster.getFileSystem(), acidEnableConf);
     primary = new WarehouseInstance(LOG, miniDFSCluster, acidEnableConf);
+    acidEnableConf.put(MetastoreConf.ConfVars.REPLDIR.getHiveName(), primary.repldDir);
     replica = new WarehouseInstance(LOG, miniDFSCluster, acidEnableConf);
     HashMap<String, String> overridesForHiveConf1 = new HashMap<String, String>() {{
         put("fs.defaultFS", miniDFSCluster.getFileSystem().getUri().toString());
@@ -96,7 +102,14 @@ public class BaseReplicationScenariosAcidTables {
         put("hive.txn.manager", "org.apache.hadoop.hive.ql.lockmgr.DummyTxnManager");
         put("hive.metastore.client.capability.check", "false");
     }};
+    overridesForHiveConf1.put(MetastoreConf.ConfVars.REPLDIR.getHiveName(), primary.repldDir);
     replicaNonAcid = new WarehouseInstance(LOG, miniDFSCluster, overridesForHiveConf1);
+  }
+
+  private static void setReplicaExternalBase(FileSystem fs, Map<String, String> confMap) throws IOException {
+    fs.mkdirs(REPLICA_EXTERNAL_BASE);
+    fullyQualifiedReplicaExternalBase =  fs.getFileStatus(REPLICA_EXTERNAL_BASE).getPath().toString();
+    confMap.put(HiveConf.ConfVars.REPL_EXTERNAL_TABLE_BASE_DIR.varname, fullyQualifiedReplicaExternalBase);
   }
 
   @AfterClass
@@ -155,12 +168,12 @@ public class BaseReplicationScenariosAcidTables {
     nonAcidTableNames.add("t4");
   }
 
-  WarehouseInstance.Tuple prepareDataAndDump(String primaryDbName, String fromReplId,
+  WarehouseInstance.Tuple prepareDataAndDump(String primaryDbName,
                                                      List<String> withClause) throws Throwable {
     prepareAcidData(primaryDbName);
     prepareNonAcidData(primaryDbName);
     return primary.run("use " + primaryDbName)
-            .dump(primaryDbName, fromReplId, withClause != null ?
+            .dump(primaryDbName, withClause != null ?
                     withClause : Collections.emptyList());
   }
 
@@ -192,7 +205,8 @@ public class BaseReplicationScenariosAcidTables {
             .run("show tables")
             .verifyResults(tableNames)
             .run("repl status " + replicatedDbName)
-            .verifyResult(lastReplId);
+            .verifyResult(lastReplId)
+            .verifyReplTargetProperty(replicatedDbName);
     verifyNonAcidTableLoad(replicatedDbName);
     if (includeAcid) {
       verifyAcidTableLoad(replicatedDbName);
@@ -225,10 +239,7 @@ public class BaseReplicationScenariosAcidTables {
   }
 
   private void runUsingDriver(IDriver driver, String command) throws Throwable {
-    CommandProcessorResponse ret = driver.run(command);
-    if (ret.getException() != null) {
-      throw ret.getException();
-    }
+    driver.run(command);
   }
 
   void prepareInc2AcidData(String dbName, HiveConf hiveConf) throws Throwable {
@@ -295,7 +306,8 @@ public class BaseReplicationScenariosAcidTables {
             .run("show tables")
             .verifyResults(tableNames)
             .run("repl status " + dbName)
-            .verifyResult(lastReplId);
+            .verifyResult(lastReplId)
+            .verifyReplTargetProperty(replicatedDbName);
     verifyIncNonAcidLoad(dbName);
     verifyIncAcidLoad(dbName);
   }
@@ -308,7 +320,8 @@ public class BaseReplicationScenariosAcidTables {
             .run("show tables")
             .verifyResults(tableNames)
             .run("repl status " + dbName)
-            .verifyResult(lastReplId);
+            .verifyResult(lastReplId)
+            .verifyReplTargetProperty(replicatedDbName);
     verifyInc2NonAcidLoad(dbName);
     verifyInc2AcidLoad(dbName);
   }

@@ -22,7 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.common.TableName;
 import org.apache.hadoop.hive.conf.HiveConf;
@@ -34,14 +34,13 @@ import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.DDLOperation;
 import org.apache.hadoop.hive.ql.ddl.DDLOperationContext;
 import org.apache.hadoop.hive.ql.ddl.DDLUtils;
-import org.apache.hadoop.hive.ql.ddl.table.constaint.AlterTableAddConstraintOperation;
+import org.apache.hadoop.hive.ql.ddl.table.constraint.add.AlterTableAddConstraintOperation;
 import org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils;
 import org.apache.hadoop.hive.ql.hooks.ReadEntity;
 import org.apache.hadoop.hive.ql.hooks.WriteEntity;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.Partition;
 import org.apache.hadoop.hive.ql.metadata.Table;
-import org.apache.hadoop.hive.ql.parse.DDLSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.session.SessionState;
 
 /**
@@ -56,15 +55,15 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
 
   @Override
   public int execute() throws HiveException {
-    if (!AlterTableUtils.allowOperationInReplicationScope(context.getDb(), desc.getTableName(), null,
+    if (!AlterTableUtils.allowOperationInReplicationScope(context.getDb(), desc.getDbTableName(), null,
         desc.getReplicationSpec())) {
       // no alter, the table is missing either due to drop/rename which follows the alter.
       // or the existing table is newer than our update.
-      LOG.debug("DDLTask: Alter Table is skipped as table {} is newer than update", desc.getTableName());
+      LOG.debug("DDLTask: Alter Table is skipped as table {} is newer than update", desc.getDbTableName());
       return 0;
     }
 
-    Table oldTable = context.getDb().getTable(desc.getTableName());
+    Table oldTable = context.getDb().getTable(desc.getDbTableName());
     List<Partition> partitions = getPartitions(oldTable, desc.getPartitionSpec(), context);
 
     // Don't change the table object returned by the metastore, as we'll mess with it's caches.
@@ -88,7 +87,7 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
       throws HiveException {
     List<Partition> partitions = null;
     if (partSpec != null) {
-      if (DDLSemanticAnalyzer.isFullSpec(tbl, partSpec)) {
+      if (AlterTableUtils.isFullPartitionSpec(tbl, partSpec)) {
         partitions = new ArrayList<Partition>();
         Partition part = context.getDb().getPartition(tbl, partSpec, false);
         if (part == null) {
@@ -99,7 +98,7 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
         }
         partitions.add(part);
       } else {
-        // DDLSemanticAnalyzer has already checked if partial partition specs are allowed,
+        // AbstractBaseAlterTableAnalyzer has already checked if partial partition specs are allowed,
         // thus we should not need to check it here.
         partitions = context.getDb().getPartitions(tbl, partSpec);
       }
@@ -124,7 +123,7 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
     return (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
   }
 
-  public void finalizeAlterTableWithWriteIdOp(Table table, Table oldTable, List<Partition> partitions,
+  private void finalizeAlterTableWithWriteIdOp(Table table, Table oldTable, List<Partition> partitions,
       DDLOperationContext context, EnvironmentContext environmentContext, AbstractAlterTableDesc alterTable)
       throws HiveException {
     if (partitions == null) {
@@ -147,7 +146,7 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
           }
           writeId = tmpWriteId;
         }
-        context.getDb().alterTable(alterTable.getTableName(), table, alterTable.isCascade(), environmentContext, true,
+        context.getDb().alterTable(alterTable.getDbTableName(), table, alterTable.isCascade(), environmentContext, true,
             writeId);
       } else {
         // Note: this is necessary for UPDATE_STATISTICS command, that operates via ADDPROPS (why?).
@@ -179,7 +178,7 @@ public abstract class AbstractAlterTableOperation<T extends AbstractAlterTableDe
 
     // This is kind of hacky - the read entity contains the old table, whereas the write entity contains the new
     // table. This is needed for rename - both the old and the new table names are passed
-    // Don't acquire locks for any of these, we have already asked for them in DDLSemanticAnalyzer.
+    // Don't acquire locks for any of these, we have already asked for them in AbstractBaseAlterTableAnalyzer.
     if (partitions != null) {
       for (Partition partition : partitions) {
         context.getWork().getInputs().add(new ReadEntity(partition));

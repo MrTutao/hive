@@ -48,7 +48,7 @@ import javax.servlet.http.HttpServletResponse;
 
 import com.google.common.base.Preconditions;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.math3.util.Pair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
@@ -113,12 +113,15 @@ public class HttpServer {
   public static final String ADMINS_ACL = "admins.acl";
   private XFrameOption xFrameOption;
   private boolean xFrameOptionIsEnabled;
+  private boolean isSSLEnabled;
   public static final String HTTP_HEADER_PREFIX = "hadoop.http.header.";
   private static final String X_FRAME_OPTIONS = "X-FRAME-OPTIONS";
   static final String X_XSS_PROTECTION  =
           "X-XSS-Protection:1; mode=block";
   static final String X_CONTENT_TYPE_OPTIONS =
           "X-Content-Type-Options:nosniff";
+  static final String STRICT_TRANSPORT_SECURITY =
+          "Strict-Transport-Security:max-age=31536000; includeSubDomains";
   private static final String HTTP_HEADER_REGEX =
           "hadoop\\.http\\.header\\.([a-zA-Z\\-_]+)";
   private static final Pattern PATTERN_HTTP_HEADER_REGEX =
@@ -137,6 +140,7 @@ public class HttpServer {
   private HttpServer(final Builder b) throws IOException {
     this.name = b.name;
     this.xFrameOptionIsEnabled = b.xFrameEnabled;
+    this.isSSLEnabled = b.useSSL;
     this.xFrameOption = b.xFrameOption;
     createWebServer(b);
   }
@@ -165,6 +169,7 @@ public class HttpServer {
     private XFrameOption xFrameOption = XFrameOption.SAMEORIGIN;
     private final List<Pair<String, Class<? extends HttpServlet>>> servlets =
         new LinkedList<Pair<String, Class<? extends HttpServlet>>>();
+    private boolean disableDirListing = false;
 
     public Builder(String name) {
       Preconditions.checkArgument(name != null && !name.isEmpty(), "Name must be specified");
@@ -299,6 +304,10 @@ public class HttpServer {
     public Builder setXFrameOption(String option) {
       this.xFrameOption = XFrameOption.getEnum(option);
       return this;
+    }
+
+    public void setDisableDirListing(boolean disableDirListing) {
+      this.disableDirListing = disableDirListing;
     }
   }
 
@@ -573,8 +582,12 @@ public class HttpServer {
     }
 
     Map<String, String> xFrameParams = setHeaders();
-    if(b.xFrameEnabled){
+    if (b.xFrameEnabled) {
       setupXframeFilter(b,xFrameParams);
+    }
+
+    if (b.disableDirListing) {
+      disableDirectoryListingOnServlet(webAppContext);
     }
 
     initializeWebServer(b, threadPool.getMaxThreads());
@@ -607,7 +620,7 @@ public class HttpServer {
     webServer.setHandler(contexts);
 
 
-    if(b.usePAM){
+    if (b.usePAM) {
       setupPam(b, contexts);
     }
 
@@ -642,6 +655,7 @@ public class HttpServer {
     staticCtx.setResourceBase(appDir + "/static");
     staticCtx.addServlet(DefaultServlet.class, "/*");
     staticCtx.setDisplayName("static");
+    disableDirectoryListingOnServlet(staticCtx);
 
     String logDir = getLogDir(b.conf);
     if (logDir != null) {
@@ -675,6 +689,10 @@ public class HttpServer {
     splitVal = X_XSS_PROTECTION.split(":");
     headers.put(HTTP_HEADER_PREFIX + splitVal[0],
             splitVal[1]);
+    if(this.isSSLEnabled){
+      splitVal = STRICT_TRANSPORT_SECURITY.split(":");
+      headers.put(HTTP_HEADER_PREFIX + splitVal[0],splitVal[1]);
+    }
     return headers;
   }
 
@@ -739,6 +757,11 @@ public class HttpServer {
       holder.setName(name);
     }
     webAppContext.addServlet(holder, pathSpec);
+  }
+
+
+  private static void disableDirectoryListingOnServlet(ServletContextHandler contextHandler) {
+    contextHandler.setInitParameter("org.eclipse.jetty.servlet.Default.dirAllowed", "false");
   }
 
   /**
